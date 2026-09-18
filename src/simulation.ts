@@ -1,4 +1,10 @@
 import { TRAFFIC_EVENTS, trafficRates, type TrafficEventId } from "./traffic";
+import {
+  ARRIVAL_EFFECT_SECONDS,
+  type Flight,
+  type FlightOutcome,
+  type FlightLeg,
+} from "./transit";
 
 export type Source = "shopify" | "stripe" | "whatsapp";
 export type Scenario = "spike" | "downtime";
@@ -68,6 +74,9 @@ export type Snapshot = {
   received: number;
   delivered: number;
   waiting: number;
+  delivering: number;
+  flights: Flight[];
+  outcomes: FlightOutcome[];
   waitingBySource: Record<Source, number>;
   failedAttempts: number;
   unsuccessful: number;
@@ -91,6 +100,14 @@ export type Snapshot = {
  * A configured retry schedule does not repair an unavailable application.
  */
 export class Simulation {
+  // Zero-delay engines remain useful for isolated delivery-policy tests.
+  // Town enables the same journey durations used by the 3D scene.
+  transit = { ingress: 0, delivery: 0 };
+  private flights: Flight[] = [];
+  private outcomes: FlightOutcome[] = [];
+  private flightSerial = 0;
+  private visualNext: Record<string, number> = {};
+  private visualCount: Record<string, number> = {};
   private traceSerial = 0;
   private tracked: TrackedEvent | null = null;
 
@@ -285,11 +302,13 @@ export class Simulation {
   }
   reset(enabled = this.enabled, scenario = this.scenario) {
     const rate = this.rate;
+    const transit = { ...this.transit };
     const source = this.spikeSource;
     Object.assign(this, new Simulation());
     this.enabled = enabled;
     this.scenario = scenario;
     this.rate = rate;
+    this.transit = transit;
     this.spikeSource = source;
   }
   replayProtected() {
@@ -346,6 +365,35 @@ export class Simulation {
     }
   }
 
+  private launch(
+    batch: Pick<Batch, "source" | "count" | "attempt" | "createdAt" | "trace">,
+    leg: FlightLeg,
+  ) {
+    if (!batch.count) return;
+    const key = `${leg}:${batch.source}`;
+    const burst = batch.count > (this.visualCount[key] ?? 0) * 2;
+    const visible = this.clock >= (this.visualNext[key] ?? 0) || burst;
+    if (visible) {
+      const rate =
+        leg === "delivery" ? this.rate : this.sourceRates[batch.source];
+      this.visualNext[key] =
+        this.clock +
+        TIME_SCALE / Math.min(8, Math.max(1.2, (rate * TIME_SCALE) / 40));
+    }
+    this.visualCount[key] = batch.count;
+    this.flights.push({
+      ...batch,
+      trace: batch.trace ? { ...batch.trace } : undefined,
+      id: ++this.flightSerial,
+      departedAt: this.clock,
+      arrivesAt:
+        this.clock +
+        (leg === "delivery" ? this.transit.delivery : this.transit.ingress),
+      leg,
+      visible,
+    });
+  }
+
   private tick(dt: number) {
     const sourceRates = this.sourceRates;
     const inputRate = this.incoming;
@@ -363,163 +411,165 @@ export class Simulation {
     }
     if (!this.inSurge) this.trafficEvent = null;
     this.ingressCredit += inputRate * dt;
-    const arrivals = Math.floor(this.ingressCredit + 1e-8);
-    this.ingressCredit -= arrivals;
-    this.received += arrivals;
-    const arrivalsBySource: Record<Source, number> = {
+    const emitted = Math.floor(this.ingressCredit + 1e-8);
+    this.ingressCredit -= emitted;
+    const bySource: Record<Source, number> = {
       shopify: 0,
       stripe: 0,
       whatsapp: 0,
     };
-    let trackedArrival: {
-      source: Source;
-      index: number;
-      offset: number;
-    } | null = null;
-    for (let i = 0; i < arrivals; i++) {
+    for (let i = 0; i < emitted; i++) {
       const source = SOURCES.reduce((largest, next) =>
         this.sourceCredits[next] > this.sourceCredits[largest] ? next : largest,
       );
-      if (
-        this.tracked?.status === "pending" &&
-        this.tracked.source === source &&
-        !trackedArrival
-      ) {
-        trackedArrival = { source, index: i, offset: arrivalsBySource[source] };
-        this.tracked.receivedAt = this.clock;
-        this.tracked.protected = this.enabled;
-        this.tracked.history.push({
-          status: "Received from provider",
-          time: this.clock,
-        });
-      }
-      arrivalsBySource[source]++;
+      bySource[source]++;
       this.sourceCredits[source]--;
     }
-    this.capacityCredit += APP_CAPACITY * dt;
-    const capacityBudget = Math.floor(this.capacityCredit + 1e-8);
-    this.capacityCredit -= capacityBudget;
-    const capacity = this.online ? capacityBudget : 0;
-    let attempts = 0;
+    for (const source of SOURCES) {
+      this.launch(
+        { source, count: bySource[source], attempt: 0, createdAt: this.clock },
+        this.enabled ? "intake" : "direct",
+      );
+    }
 
-    if (!this.enabled) {
-      const success = Math.min(arrivals, capacity);
-      this.delivered += success;
-      this.failedAttempts += arrivals - success;
-      this.unsuccessful += arrivals - success;
-      attempts = arrivals;
-      if (trackedArrival && this.tracked) {
-        this.tracked.attempts = 1;
-        const accepted = trackedArrival.index < success;
-        this.traceStatus(
-          accepted ? "delivered" : "failed",
-          accepted ? "Endpoint accepted webhook" : "Direct delivery failed",
-        );
+    // A route belongs to the request at departure. Detaching a provider or
+    // deploying Hookdeck cannot erase requests already travelling to an endpoint.
+    const arriving = this.flights.filter(
+      (f) => f.arrivesAt <= this.clock + 1e-8,
+    );
+    this.flights = this.flights.filter((f) => f.arrivesAt > this.clock + 1e-8);
+    const deliveries: Flight[] = [];
+    for (const flight of arriving) {
+      if (flight.leg !== "delivery") {
+        this.received += flight.count;
+        if (
+          this.tracked?.status === "pending" &&
+          this.tracked.source === flight.source
+        ) {
+          flight.trace = { id: this.tracked.id, offset: 0 };
+          this.tracked.receivedAt = this.clock;
+          this.tracked.protected = flight.leg === "intake";
+          this.tracked.history.push({
+            status: "Received from provider",
+            time: this.clock,
+          });
+        }
       }
-      if (
-        arrivals &&
-        Math.floor(this.clock * 2) !== Math.floor((this.clock - dt) * 2)
-      ) {
-        this.record(
-          SOURCES.reduce(
-            (largest, next) =>
-              arrivalsBySource[next] > arrivalsBySource[largest]
-                ? next
-                : largest,
-            SOURCES[this.id % 3],
-          ),
-          success < arrivals ? "failed" : "delivered",
-          1,
-        );
-      }
-    } else {
-      for (const source of SOURCES) {
-        const trace =
-          trackedArrival?.source === source && this.tracked
-            ? { id: this.tracked.id, offset: trackedArrival.offset }
-            : undefined;
-        this.enqueue(source, arrivalsBySource[source], trace);
-        if (trace) this.traceStatus("queued", "Buffered by Hookdeck");
-      }
+      if (flight.leg === "intake") {
+        this.enqueue(flight.source, flight.count, flight.trace);
+        if (flight.trace) this.traceStatus("queued", "Buffered by Hookdeck");
+      } else deliveries.push(flight);
+    }
+
+    if (this.enabled) {
       this.deliveryCredit += this.rate * dt;
       let budget = Math.floor(this.deliveryCredit + 1e-8);
       this.deliveryCredit -= budget;
-      let available = capacity;
-      const failed: Batch[] = [];
       for (const batch of this.batches) {
         if (!budget) break;
         if (batch.readyAt > this.clock) continue;
         const count = Math.min(batch.count, budget);
-        const success = Math.min(count, available);
-        const failure = count - success;
-        let failedTrace: Batch["trace"];
+        let trace: Batch["trace"];
         if (batch.trace) {
           if (batch.trace.offset < count) {
-            const trace = batch.trace;
+            trace = batch.trace;
             delete batch.trace;
-            if (trace.offset >= success)
-              failedTrace = { ...trace, offset: trace.offset - success };
-            if (this.tracked?.id === trace.id) {
-              this.tracked.attempts = batch.attempt + 1;
-              if (trace.offset < success)
-                this.traceStatus("delivered", "Endpoint accepted webhook");
-              else if (batch.attempt < 7) {
-                this.tracked.nextAttemptAt =
-                  this.clock + Math.min(60, 5 * 2 ** batch.attempt);
-                this.traceStatus(
-                  "retrying",
-                  `Attempt ${batch.attempt + 1} failed · retry scheduled`,
-                );
-              } else this.traceStatus("failed", "Retry limit reached");
-            }
           } else batch.trace.offset -= count;
         }
+        this.launch({ ...batch, count, trace }, "delivery");
         batch.count -= count;
         budget -= count;
-        available -= success;
-        attempts += count;
-        this.delivered += success;
-        if (failure) {
-          this.failedAttempts += failure;
-          if (batch.attempt < 7) {
-            failed.push({
-              ...batch,
-              count: failure,
-              attempt: batch.attempt + 1,
-              readyAt: this.clock + Math.min(60, 5 * 2 ** batch.attempt),
-              trace: failedTrace,
-            });
-          } else this.unsuccessful += failure;
-        }
-        if (
-          count &&
-          Math.floor(this.clock * 2) !== Math.floor((this.clock - dt) * 2)
-        ) {
-          this.record(
-            batch.source,
-            failure ? (batch.attempt < 7 ? "retrying" : "failed") : "delivered",
-            batch.attempt + 1,
-          );
-        }
       }
       this.batches = this.batches.filter((batch) => batch.count > 0);
-      for (const batch of failed) {
-        const same = this.batches.findLast(
-          (b) =>
-            b.source === batch.source &&
-            b.attempt === batch.attempt &&
-            Math.floor(b.readyAt) === Math.floor(batch.readyAt),
-        );
-        if (same) {
-          if (batch.trace)
-            same.trace = {
-              ...batch.trace,
-              offset: same.count + batch.trace.offset,
-            };
-          same.count += batch.count;
-        } else this.batches.push(batch);
-      }
     }
+    // Zero transit settles in the same tick; real journeys settle on arrival.
+    deliveries.push(
+      ...this.flights.filter(
+        (f) => f.leg === "delivery" && f.arrivesAt <= this.clock + 1e-8,
+      ),
+    );
+    this.flights = this.flights.filter((f) => f.arrivesAt > this.clock + 1e-8);
+    this.capacityCredit += APP_CAPACITY * dt;
+    const capacity = Math.floor(this.capacityCredit + 1e-8);
+    this.capacityCredit -= capacity;
+    let available = this.online ? capacity : 0;
+    let attempts = 0;
+    for (const flight of deliveries) {
+      const success = Math.min(flight.count, available);
+      const failure = flight.count - success;
+      available -= success;
+      attempts += flight.count;
+      this.delivered += success;
+      this.failedAttempts += failure;
+      const retries = flight.leg === "delivery" && flight.attempt < 7;
+      const readyAt = this.clock + Math.min(60, 5 * 2 ** flight.attempt);
+      let failedTrace: Batch["trace"];
+      if (flight.trace && this.tracked?.id === flight.trace.id) {
+        this.tracked.attempts = flight.attempt + 1;
+        if (flight.trace.offset < success)
+          this.traceStatus("delivered", "Endpoint accepted webhook");
+        else {
+          failedTrace = {
+            ...flight.trace,
+            offset: flight.trace.offset - success,
+          };
+          if (retries) {
+            this.tracked.nextAttemptAt = readyAt;
+            this.traceStatus(
+              "retrying",
+              `Attempt ${flight.attempt + 1} failed · retry scheduled`,
+            );
+          } else
+            this.traceStatus(
+              "failed",
+              flight.leg === "direct"
+                ? "Direct delivery failed"
+                : "Retry limit reached",
+            );
+        }
+      }
+      if (failure) {
+        if (retries) {
+          const same = this.batches.findLast(
+            (b) =>
+              b.source === flight.source &&
+              b.attempt === flight.attempt + 1 &&
+              Math.floor(b.readyAt) === Math.floor(readyAt),
+          );
+          if (same) {
+            if (failedTrace)
+              same.trace = {
+                ...failedTrace,
+                offset: same.count + failedTrace.offset,
+              };
+            same.count += failure;
+          } else
+            this.batches.push({
+              source: flight.source,
+              count: failure,
+              attempt: flight.attempt + 1,
+              readyAt,
+              createdAt: flight.createdAt,
+              trace: failedTrace,
+            });
+        } else this.unsuccessful += failure;
+      }
+      if (flight.visible)
+        this.outcomes.push({
+          ...flight,
+          settledAt: this.clock,
+          failed: failure,
+        });
+      if (Math.floor(this.clock * 2) !== Math.floor((this.clock - dt) * 2))
+        this.record(
+          flight.source,
+          failure ? (retries ? "retrying" : "failed") : "delivered",
+          flight.attempt + 1,
+        );
+    }
+    this.outcomes = this.outcomes.filter(
+      (f) => this.clock - f.settledAt < ARRIVAL_EFFECT_SECONDS * TIME_SCALE,
+    );
     this.rateSamples.push({
       delivered: this.delivered - deliveredBefore,
       attempts,
@@ -587,6 +637,11 @@ export class Simulation {
       received: this.received,
       delivered: this.delivered,
       waiting,
+      delivering: this.flights
+        .filter((f) => f.leg === "delivery")
+        .reduce((n, f) => n + f.count, 0),
+      flights: this.flights.map((f) => ({ ...f })),
+      outcomes: this.outcomes.map((f) => ({ ...f })),
       waitingBySource: this.batches.reduce(
         (counts, batch) => {
           counts[batch.source] += batch.count;

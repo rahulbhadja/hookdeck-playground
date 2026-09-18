@@ -6,7 +6,7 @@ import { DEMO_SECONDS, DEMO_TIMING } from "./demo";
 function conserved(town: Town) {
   const snapshot = town.snapshot();
   expect(snapshot.received).toBe(
-    snapshot.delivered + snapshot.waiting + snapshot.lost,
+    snapshot.delivered + snapshot.waiting + snapshot.delivering + snapshot.lost,
   );
 }
 function advanceTo(town: Town, seconds: number) {
@@ -30,9 +30,12 @@ describe("optional 45-second webhook emergency", () => {
     advanceTo(town, DEMO_TIMING.providers + 2.1);
     expect(visibleAt(town, ARRIVAL.shopify)).toBe(true);
     expect(visibleAt(town, ARRIVAL.whatsapp)).toBe(false);
+    expect(app.delivered).toBe(0);
+    expect(app.snapshot().flights.length).toBeGreaterThan(0);
+    advanceTo(town, 9.5);
     expect(app.delivered).toBeGreaterThan(0);
     expect(town.destinations.n8n.received).toBe(0);
-    advanceTo(town, DEMO_TIMING.automation + 2.5);
+    advanceTo(town, DEMO_TIMING.automation + 4.5);
     expect(town.snapshot().demo.phase).toBe("automation");
     expect(visibleAt(town, ARRIVAL.n8n + 1)).toBe(true);
     expect(town.destinations.n8n.delivered).toBeGreaterThan(0);
@@ -62,8 +65,8 @@ describe("optional 45-second webhook emergency", () => {
       const lost = town.snapshot().lost;
       advanceTo(town, DEMO_TIMING.guard + 0.1);
       expect(town.snapshot().demo.phase).toBe("guard");
-      const rescueLosses = town.snapshot().lost;
-      expect(rescueLosses).toBeGreaterThanOrEqual(lost);
+      const deploymentLosses = town.snapshot().lost;
+      expect(deploymentLosses).toBeGreaterThanOrEqual(lost);
       for (const receiver of [app, town.destinations[id]]) {
         expect(receiver.online).toBe(true);
         expect(receiver.enabled).toBe(true);
@@ -73,7 +76,8 @@ describe("optional 45-second webhook emergency", () => {
       expect(town.mode).toBe("demo");
       advanceTo(town, DEMO_TIMING.draining);
       expect(town.snapshot().waiting).toBeGreaterThan(0);
-      expect(town.snapshot().lost).toBe(rescueLosses);
+      const rescueLosses = town.snapshot().lost;
+      expect(rescueLosses).toBeGreaterThan(deploymentLosses);
       advanceTo(town, DEMO_TIMING.steady);
       expect(town.snapshot().waiting).toBe(0);
       advanceTo(town, DEMO_SECONDS - 0.05);

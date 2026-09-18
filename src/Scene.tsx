@@ -40,6 +40,11 @@ import {
   type OpenParcel,
 } from "./parcel";
 import { PackageOpening } from "./PackageOpening";
+import {
+  ARRIVAL_EFFECT_SECONDS,
+  type Flight,
+  type FlightOutcome,
+} from "./transit";
 
 type Vec = [number, number, number];
 type Props = {
@@ -58,6 +63,8 @@ type Props = {
   selectedParcel: OpenParcel | null;
   inspectRequest: number;
   onClosePackage: () => void;
+  onFlowHover: (held: boolean) => void;
+  playbackSpeed: number;
   readOnly: boolean;
 };
 const C = {
@@ -302,7 +309,8 @@ function Gateway({
   const deployment = useRef(0);
   const warmed = useRef(false);
   const invalidate = useThree((state) => state.invalidate);
-  const enabled = snapshot.enabled;
+  const enabled =
+    snapshot.enabled || snapshot.flights.some((f) => f.leg !== "direct");
   const color = C.hookdeck;
   useLayoutEffect(() => {
     deployment.current = 0;
@@ -691,32 +699,34 @@ function Route({
     </group>
   );
 }
-/** Large, persistent 3D parcels. New traffic changes spawning, not existing positions. */
+/** Packages are views of actual in-flight simulation batches, not a second clock. */
 function Flow({
   curve,
-  rate,
   color,
-  moving,
+  clock,
+  paused,
+  playbackSpeed,
+  flights,
   reduceMotion,
   reset,
-  failureRatio = 0,
   onInspect,
+  onFlowHover,
   packageRoute,
-  packageSources,
   selectedParcel,
   inspectRequest = 0,
   requestEnabled = false,
 }: {
   curve: THREE.CatmullRomCurve3;
-  rate: number;
   color: string;
-  moving: boolean;
+  clock: number;
+  paused: boolean;
+  playbackSpeed: number;
+  flights: (Flight | FlightOutcome)[];
   reduceMotion: boolean;
   reset: number;
-  failureRatio?: number;
   onInspect?: (selection: OpenParcel) => void;
+  onFlowHover: Props["onFlowHover"];
   packageRoute: ParcelRoute;
-  packageSources?: Source[];
   selectedParcel: OpenParcel | null;
   inspectRequest?: number;
   requestEnabled?: boolean;
@@ -724,16 +734,16 @@ function Flow({
   const body = useRef<THREE.InstancedMesh>(null),
     lid = useRef<THREE.InstancedMesh>(null),
     tape = useRef<THREE.InstancedMesh>(null);
-  const progress = useRef(new Float32Array(160).fill(-1)),
-    lanes = useRef(new Float32Array(160)),
-    ids = useRef(new Uint32Array(160));
-  const records = useRef<(Parcel | null)[]>(Array(160).fill(null));
-  const renderedSlots = useRef<number[]>([]);
-  const serial = useRef(0),
-    cursor = useRef(0),
-    credit = useRef(0);
+  const records = useRef(new Map<number, Parcel>());
+  const rendered = useRef<
+    { flight: Flight | FlightOutcome; parcel: Parcel; progress: number }[]
+  >([]);
   const hover = useRef(new ParcelHover());
   const hoverMaterial = useRef<THREE.MeshBasicMaterial>(null);
+  const sync = useRef({ clock, at: performance.now() });
+  useLayoutEffect(() => {
+    sync.current = { clock, at: performance.now() };
+  }, [clock, paused]);
   const invalidate = useThree((state) => state.invalidate);
   const point = useMemo(() => new THREE.Vector3(), []),
     tangent = useMemo(() => new THREE.Vector3(), []);
@@ -741,23 +751,6 @@ function Flow({
     base = useMemo(() => new THREE.Color(color), [color]);
   const red = useMemo(() => new THREE.Color(C.red), []),
     white = useMemo(() => new THREE.Color("#fff"), []);
-  const speed = 3.6 / useMemo(() => curve.getLength(), [curve]);
-  const spawn = (slot: number, at = 0) => {
-    const sequence = serial.current++;
-    progress.current[slot] = at;
-    ids.current[slot] = sequence;
-    lanes.current[slot] = rate > 150 ? ((sequence % 3) - 1) * 0.12 : 0;
-    // The shared outgoing lane carries sample events from the connected
-    // providers. Store the source at spawn so inspecting never changes it.
-    const source = packageSources?.length
-      ? packageSources[sequence % packageSources.length]
-      : packageRoute.source;
-    records.current[slot] = createParcel(
-      { ...packageRoute, source },
-      sequence,
-      reset,
-    );
-  };
   useEffect(() => {
     const sphere = new THREE.Box3()
       .setFromPoints(curve.getSpacedPoints(48))
@@ -767,38 +760,31 @@ function Flow({
       if (mesh) mesh.boundingSphere = sphere;
   }, [curve]);
   useEffect(() => {
-    progress.current.fill(-1);
-    lanes.current.fill(0);
-    records.current.fill(null);
-    credit.current = 0;
-    cursor.current = 0;
+    records.current.clear();
     hover.current = new ParcelHover();
-    if (rate > 0) {
-      for (let i = 0; i < 3; i++) spawn(i, 0.12 + i * 0.29);
-      cursor.current = 3;
-    }
     return () => {
       document.body.style.cursor = "";
+      onFlowHover(false);
     };
-  }, [reset]);
-  const openInstance = (instanceIndex: number) => {
+  }, [reset, onFlowHover]);
+  const openInstance = (index: number) => {
     if (!onInspect || !body.current || selectedParcel) return;
-    const slot = renderedSlots.current[instanceIndex];
-    const parcel = records.current[slot];
-    if (!parcel) return;
+    const record = rendered.current[index];
+    if (!record) return;
     const matrix = new THREE.Matrix4();
-    body.current.getMatrixAt(instanceIndex, matrix);
+    body.current.getMatrixAt(index, matrix);
     matrix.premultiply(body.current.matrixWorld);
     const position = new THREE.Vector3(),
       rotation = new THREE.Quaternion(),
       scale = new THREE.Vector3();
     matrix.decompose(position, rotation, scale);
     hover.current.leave();
+    onFlowHover(false);
     document.body.style.cursor = "";
     const actualColor = new THREE.Color();
-    body.current.getColorAt(instanceIndex, actualColor);
+    body.current.getColorAt(index, actualColor);
     onInspect({
-      parcel,
+      parcel: record.parcel,
       position: position.toArray(),
       rotation: rotation.toArray(),
       color: actualColor.getStyle(),
@@ -808,8 +794,8 @@ function Flow({
   useEffect(() => {
     if (lastRequest.current === inspectRequest) return;
     lastRequest.current = inspectRequest;
-    if (requestEnabled && rate > 0 && renderedSlots.current.length)
-      openInstance(Math.floor(renderedSlots.current.length / 2));
+    if (requestEnabled && rendered.current.length)
+      openInstance(Math.floor(rendered.current.length / 2));
   }, [inspectRequest]);
   useFrame((_, delta) => {
     if (!body.current || !lid.current || !tape.current) return;
@@ -822,63 +808,72 @@ function Flow({
         12,
         dt,
       );
-    if (rate === 0) {
-      progress.current.fill(-1);
-      records.current.fill(null);
-      credit.current = 0;
-    }
-    if (moving && !reduceMotion && !held && !selectedParcel && rate > 0) {
-      credit.current +=
-        dt * Math.min(8, Math.max(1.2, (rate * TIME_SCALE) / 40));
-      while (credit.current >= 1) {
-        spawn(cursor.current);
-        cursor.current = (cursor.current + 1) % 160;
-        credit.current -= 1;
-      }
-      for (let i = 0; i < 160; i++) {
-        if (progress.current[i] < 0) continue;
-        progress.current[i] += dt * speed;
-        if (progress.current[i] >= 1) progress.current[i] = -1;
-      }
-    }
+    // Interpolate between React snapshots, capped to one update interval. The
+    // same simulation timestamps work in normal play, pause and 4x comparison.
+    const time =
+      clock +
+      (paused || reduceMotion
+        ? 0
+        : Math.min(0.08, (performance.now() - sync.current.at) / 1000) *
+          TIME_SCALE *
+          playbackSpeed);
     let index = 0;
-    renderedSlots.current.length = 0;
-    for (let i = 0; i < (reduceMotion ? 4 : 160); i++) {
-      const t = reduceMotion
-        ? rate > 0
-          ? 0.12 + i * 0.24
-          : -1
-        : progress.current[i];
-      if (t < 0) continue;
-      if (!records.current[i]) spawn(i, t);
-      const parcel = records.current[i];
+    rendered.current.length = 0;
+    const active = new Set<number>();
+    for (const flight of flights) {
+      if (!flight.visible || index >= 160) continue;
+      active.add(flight.id);
+      let parcel = records.current.get(flight.id);
+      if (!parcel) {
+        parcel = createParcel(
+          { ...packageRoute, source: flight.source },
+          flight.id,
+          reset,
+        );
+        records.current.set(flight.id, parcel);
+      }
       if (parcel === selectedParcel?.parcel) continue;
-      const rejected = ((ids.current[i] * 37) % 100) / 100 < failureRatio;
-      curve.getPointAt(t, point);
-      curve.getTangentAt(t, tangent);
+      const outcome = "settledAt" in flight ? flight : null;
+      if (outcome && (!outcome.failed || reduceMotion)) continue;
+      const progress = THREE.MathUtils.clamp(
+        (time - flight.departedAt) /
+          Math.max(0.001, flight.arrivesAt - flight.departedAt),
+        0,
+        1,
+      );
+      curve.getPointAt(progress, point);
+      curve.getTangentAt(progress, tangent);
+      const lane = flight.count > 8 ? ((flight.id % 3) - 1) * 0.12 : 0;
       unit.position.set(
-        point.x - tangent.z * lanes.current[i],
+        point.x - tangent.z * lane,
         point.y + 0.21,
-        point.z + tangent.x * lanes.current[i],
+        point.z + tangent.x * lane,
       );
       unit.rotation.set(0, Math.atan2(tangent.x, tangent.z), 0);
       unit.scale.setScalar(1);
-      if (rejected && t > 0.87) {
-        const hit = (t - 0.87) / 0.13;
+      if (outcome) {
+        const hit = THREE.MathUtils.clamp(
+          (time - outcome.settledAt) / (ARRIVAL_EFFECT_SECONDS * TIME_SCALE),
+          0,
+          1,
+        );
         unit.position.y += Math.sin(hit * Math.PI) * 0.5;
-        unit.rotation.z = hit * 1.8;
         unit.position.z += hit * 0.45;
-        unit.scale.setScalar(Math.min(1, (1 - t) / 0.035));
+        unit.rotation.z = hit * 1.8;
+        unit.scale.setScalar(1 - hit);
       }
       unit.updateMatrix();
       for (const mesh of [body.current, lid.current, tape.current])
         mesh.setMatrixAt(index, unit.matrix);
-      paint.copy(rejected && t > 0.8 ? red : base);
+      paint.copy(outcome ? red : base);
       body.current.setColorAt(index, paint);
       lid.current.setColorAt(index, paint.lerp(white, 0.16));
-      renderedSlots.current.push(i);
+      rendered.current.push({ flight, parcel, progress });
       index++;
     }
+    for (const [id, parcel] of records.current)
+      if (!active.has(id) && parcel !== selectedParcel?.parcel)
+        records.current.delete(id);
     for (const mesh of [body.current, lid.current, tape.current]) {
       mesh.count = index;
       mesh.instanceMatrix.needsUpdate = true;
@@ -892,19 +887,19 @@ function Flow({
         if (!onInspect || selectedParcel) return;
         event.stopPropagation();
         hover.current.enter();
+        onFlowHover(true);
         document.body.style.cursor = "pointer";
         invalidate();
       }}
       onPointerOut={() => {
         hover.current.leave();
+        onFlowHover(false);
         document.body.style.cursor = "";
         invalidate();
       }}
       onClick={(event) => {
         if (event.delta > 5 || !onInspect || selectedParcel) return;
         event.stopPropagation();
-        // The forgiving route target can be in front of the box. Prefer an
-        // actual intersected instance before falling back to the nearest one.
         const hit = event.intersections.find(
           (item) =>
             item.object === body.current ||
@@ -915,17 +910,10 @@ function Flow({
           openInstance(hit.instanceId);
           return;
         }
-        // A click/tap on the wide route target opens its nearest visible parcel.
         let nearest = -1,
           distance = Infinity;
-        for (let i = 0; i < renderedSlots.current.length; i++) {
-          const slot = renderedSlots.current[i];
-          curve.getPointAt(
-            reduceMotion
-              ? 0.12 + slot * 0.24
-              : Math.max(0, progress.current[slot]),
-            point,
-          );
+        for (let i = 0; i < rendered.current.length; i++) {
+          curve.getPointAt(rendered.current[i].progress, point);
           body.current?.parent?.localToWorld(point);
           const d = point.distanceToSquared(event.point);
           if (d < distance) {
@@ -936,7 +924,7 @@ function Flow({
         if (nearest >= 0) openInstance(nearest);
       }}
     >
-      {rate > 0 && onInspect && (
+      {flights.some((f) => f.visible) && onInspect && (
         <mesh>
           <tubeGeometry args={[curve, 64, 0.48, 6, false]} />
           <meshBasicMaterial
@@ -1132,6 +1120,8 @@ function Streets({
   selectedParcel,
   inspectRequest,
   readOnly,
+  onFlowHover,
+  playbackSpeed,
 }: {
   snapshot: Snapshot;
   layout: TownLayout;
@@ -1142,14 +1132,14 @@ function Streets({
   selectedParcel: Props["selectedParcel"];
   inspectRequest: number;
   readOnly: boolean;
+  onFlowHover: Props["onFlowHover"];
+  playbackSpeed: number;
 }) {
   const {
     providers: positions,
     app: appPosition,
     automations: automationPositions,
   } = layout;
-  const state = present(snapshot);
-  const moving = !snapshot.paused;
   const canInspect = !readOnly && town.mode !== "demo";
   const connectedSources = sources.filter(
     (source) => snapshot.sourceConnected[source],
@@ -1229,30 +1219,50 @@ function Streets({
       >,
     [layout],
   );
+  const journeys = (s: Snapshot, leg: Flight["leg"], source?: Source) =>
+    [...s.flights, ...s.outcomes].filter(
+      (f) => f.leg === leg && (!source || f.source === source),
+    );
+  const common = {
+    paused: snapshot.paused,
+    playbackSpeed,
+    reduceMotion,
+    reset: run,
+    onInspect: canInspect ? onInspect : undefined,
+    onFlowHover,
+    selectedParcel,
+  };
+  const outputFlights = journeys(snapshot, "delivery");
   return (
     <>
       {sources.map((source, i) => {
         const visible =
           snapshot.sourceConnected[source] &&
-          visibleAt(town, ARRIVAL[source] + 0.7);
+          visibleAt(town, ARRIVAL[source] + 0.8);
+        const intakeFlights = journeys(snapshot, "intake", source);
+        const directFlights = journeys(snapshot, "direct", source);
         return (
           <group key={source}>
             <Route
               curve={input[i]}
               color={C[source]}
-              shown={visible && snapshot.enabled}
+              shown={(visible && snapshot.enabled) || intakeFlights.length > 0}
               reduceMotion={reduceMotion}
               paused={snapshot.paused}
             />
             <Route
               curve={direct[i]}
               color={C[source]}
-              shown={visible && !snapshot.enabled}
+              shown={(visible && !snapshot.enabled) || directFlights.length > 0}
               reduceMotion={reduceMotion}
               paused={snapshot.paused}
             />
             <Flow
+              {...common}
               curve={input[i]}
+              clock={snapshot.clock}
+              flights={intakeFlights}
+              color={C[source]}
               packageRoute={{
                 id: `${source}-intake`,
                 source,
@@ -1261,18 +1271,13 @@ function Streets({
               }}
               inspectRequest={inspectRequest}
               requestEnabled={source === firstSource && snapshot.enabled}
-              onInspect={canInspect ? onInspect : undefined}
-              selectedParcel={selectedParcel}
-              rate={
-                visible && snapshot.enabled ? snapshot.sourceRates[source] : 0
-              }
-              color={C[source]}
-              moving={moving}
-              reduceMotion={reduceMotion}
-              reset={run}
             />
             <Flow
+              {...common}
               curve={direct[i]}
+              clock={snapshot.clock}
+              flights={directFlights}
+              color={C[source]}
               packageRoute={{
                 id: `${source}-app`,
                 source,
@@ -1281,20 +1286,6 @@ function Streets({
               }}
               inspectRequest={inspectRequest}
               requestEnabled={source === firstSource && !snapshot.enabled}
-              onInspect={canInspect ? onInspect : undefined}
-              selectedParcel={selectedParcel}
-              rate={
-                visible && !snapshot.enabled ? snapshot.sourceRates[source] : 0
-              }
-              color={C[source]}
-              moving={moving}
-              reduceMotion={reduceMotion}
-              reset={run}
-              failureRatio={
-                state.health === "offline"
-                  ? 1
-                  : Math.max(0, 1 - 100 / Math.max(1, snapshot.incoming))
-              }
             />
           </group>
         );
@@ -1302,26 +1293,22 @@ function Streets({
       <Route
         curve={output}
         color={C.hookdeck}
-        shown={snapshot.enabled}
+        shown={snapshot.enabled || outputFlights.length > 0}
         reduceMotion={reduceMotion}
         paused={snapshot.paused}
       />
       <Flow
+        {...common}
         curve={output}
-        onInspect={canInspect ? onInspect : undefined}
-        selectedParcel={selectedParcel}
+        clock={snapshot.clock}
+        flights={outputFlights}
+        color={C.hookdeck}
         packageRoute={{
           id: "hookdeck-app",
           source: firstSource,
           destination: "app",
           viaHookdeck: true,
         }}
-        packageSources={connectedSources}
-        rate={snapshot.enabled && snapshot.online ? snapshot.attemptRate : 0}
-        color={C.hookdeck}
-        moving={moving}
-        reduceMotion={reduceMotion}
-        reset={run}
       />
       {town.automation &&
         AUTOMATIONS.map((id) => {
@@ -1329,66 +1316,55 @@ function Streets({
             spec = AUTOMATION[id],
             paths = branchPaths[id];
           const visible =
-            town.automation === id && visibleAt(town, ARRIVAL[id] + 0.7);
-          const directVisible =
-            visible && snapshot.sourceConnected[spec.source];
+            town.automation === id && visibleAt(town, ARRIVAL[id] + 0.8);
+          if (!visible) return null;
+          const deliveries = journeys(branch, "delivery"),
+            directDeliveries = journeys(branch, "direct");
           return (
             <group key={id}>
               <Route
                 curve={paths.protected}
                 color={spec.color}
-                shown={visible && snapshot.enabled}
-                active={branch.online}
+                shown={snapshot.enabled || deliveries.length > 0}
                 reduceMotion={reduceMotion}
                 paused={snapshot.paused}
               />
               <Route
                 curve={paths.direct}
                 color={spec.color}
-                shown={directVisible && !snapshot.enabled}
+                shown={
+                  (!snapshot.enabled &&
+                    snapshot.sourceConnected[spec.source]) ||
+                  directDeliveries.length > 0
+                }
                 reduceMotion={reduceMotion}
                 paused={snapshot.paused}
               />
               <Flow
+                {...common}
                 curve={paths.protected}
+                clock={branch.clock}
+                flights={deliveries}
+                color={C[spec.source]}
                 packageRoute={{
                   id: `${spec.source}-${id}-protected`,
                   source: spec.source,
                   destination: id,
                   viaHookdeck: true,
                 }}
-                onInspect={canInspect ? onInspect : undefined}
-                selectedParcel={selectedParcel}
-                rate={
-                  visible && snapshot.enabled && branch.online
-                    ? branch.attemptRate
-                    : 0
-                }
-                color={C[spec.source]}
-                moving={moving}
-                reduceMotion={reduceMotion}
-                reset={run}
               />
               <Flow
+                {...common}
                 curve={paths.direct}
+                clock={branch.clock}
+                flights={directDeliveries}
+                color={C[spec.source]}
                 packageRoute={{
                   id: `${spec.source}-${id}-direct`,
                   source: spec.source,
                   destination: id,
                   viaHookdeck: false,
                 }}
-                onInspect={canInspect ? onInspect : undefined}
-                selectedParcel={selectedParcel}
-                rate={visible && !snapshot.enabled ? branch.incoming : 0}
-                color={C[spec.source]}
-                moving={moving}
-                reduceMotion={reduceMotion}
-                reset={run}
-                failureRatio={
-                  !branch.online
-                    ? 1
-                    : Math.max(0, 1 - 100 / Math.max(1, branch.incoming))
-                }
               />
             </group>
           );
@@ -1396,6 +1372,7 @@ function Streets({
     </>
   );
 }
+
 function fitCamera(locations: Vec[], aspect: number, ceiling = 5.9) {
   const lens = new THREE.PerspectiveCamera(42, aspect, 0.1, 240);
   const target = new THREE.Box3()
@@ -1633,6 +1610,7 @@ function World(props: Props) {
     return {
       ...snapshot,
       waiting: town.waiting,
+      flights: [...snapshot.flights, ...branches.flatMap((d) => d.flights)],
       online: snapshot.online || branches.some((d) => d.online),
       attemptRate:
         snapshot.attemptRate + branches.reduce((n, d) => n + d.attemptRate, 0),
@@ -1765,6 +1743,8 @@ function World(props: Props) {
             </BuildReveal>
           ))}
         <Streets
+          onFlowHover={props.onFlowHover}
+          playbackSpeed={props.playbackSpeed}
           layout={layout}
           snapshot={snapshot}
           town={town}

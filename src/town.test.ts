@@ -12,17 +12,19 @@ import {
 
 function conservation(town: Town) {
   const s = town.snapshot();
-  expect(s.received).toBe(s.delivered + s.waiting + s.lost);
+  expect(s.received).toBe(s.delivered + s.waiting + s.delivering + s.lost);
   for (const id of AUTOMATIONS) {
     const d = s.destinations[id];
-    expect(d.received).toBe(d.delivered + d.waiting + d.unsuccessful);
+    expect(d.received).toBe(
+      d.delivered + d.waiting + d.delivering + d.unsuccessful,
+    );
   }
 }
 function assemble(town: Town, automation: Automation = "n8n") {
   town.build();
   town.step(4);
   town.addAutomation(automation);
-  town.step(4);
+  town.step(5);
 }
 describe("player-led Hookdeck town", () => {
   it.each(["make", "n8n"] as const)(
@@ -45,7 +47,7 @@ describe("player-led Hookdeck town", () => {
       expect(constructionBusy(town)).toBe(false);
       town.toggleProvider("whatsapp");
       town.addAutomation(replacement);
-      town.step(4);
+      town.step(5);
       expect(town.automation).toBe(replacement);
       expect(town.destinations[replacement].delivered).toBeGreaterThan(0);
       expect(town.destinations.zapier.received).toBe(0);
@@ -63,7 +65,7 @@ describe("player-led Hookdeck town", () => {
     const crashed = town.snapshot(),
       crashedApp = app.snapshot();
     town.deployGuard();
-    town.step(3);
+    town.step(4);
     expect(app.waiting).toBeGreaterThan(0);
     expect(town.undo()).toBe(true);
     expect(town.snapshot()).toEqual(crashed);
@@ -107,6 +109,7 @@ describe("player-led Hookdeck town", () => {
     expect(constructionBusy(town)).toBe(false);
     town.addAutomation("n8n");
     town.toggleProvider("shopify");
+    town.step(3.2);
     town.startEmergency("storm");
     town.deployGuard();
     town.step(120);
@@ -182,7 +185,7 @@ describe("player-led Hookdeck town", () => {
       town = new Town(app);
     assemble(town);
     town.startEmergency("storm");
-    town.step(3);
+    town.step(3.5);
     expect(town.mode).toBe("emergency");
     expect(app.enabled).toBe(false);
     for (const destination of [app, town.destinations.n8n]) {
@@ -196,8 +199,8 @@ describe("player-led Hookdeck town", () => {
     expect(town.mode).toBe("playing");
     expect(town.snapshot().received).toBe(received);
     expect(app.incoming).toBe(incoming);
-    town.step(3);
-    expect(town.snapshot().lost).toBe(lost);
+    town.step(4);
+    expect(town.snapshot().lost).toBeGreaterThan(lost);
     expect(town.snapshot().waiting).toBeGreaterThan(0);
     for (const destination of [app, town.destinations.n8n]) {
       expect(present(destination.snapshot()).health).toBe("healthy");
@@ -211,7 +214,7 @@ describe("player-led Hookdeck town", () => {
         town = new Town(app);
       assemble(town, id);
       town.startEmergency("storm");
-      town.step(3);
+      town.step(6);
       for (const destination of [app, town.destinations[id]]) {
         expect(destination.online).toBe(true);
         expect(destination.snapshot().overloadProgress).toBeGreaterThan(0.5);
@@ -239,9 +242,9 @@ describe("player-led Hookdeck town", () => {
         lost: before.lost,
       });
       expect(app.incoming).toBe(incoming);
-      const delivered = town.snapshot().delivered,
-        lost = town.snapshot().lost;
-      town.step(3);
+      const delivered = town.snapshot().delivered;
+      town.step(6);
+      const lost = town.snapshot().lost;
       expect(town.snapshot().delivered).toBeGreaterThan(delivered);
       expect(town.snapshot().lost).toBe(lost);
       expect(town.snapshot().waiting).toBeGreaterThan(0);
@@ -261,9 +264,9 @@ describe("player-led Hookdeck town", () => {
       town = new Town(app);
     town.explore("n8n");
     app.startAllSpikes();
-    town.step(2);
+    town.step(4);
     app.disconnect();
-    town.step(5);
+    town.step(8);
     expect(app.offlineReason).toBe("overload");
     expect(town.destinations.n8n.offlineReason).toBe("overload");
     const before = town.snapshot();
@@ -285,7 +288,7 @@ describe("player-led Hookdeck town", () => {
     app.paused = false;
     town.step(10);
     expect(town.snapshot().delivered).toBeGreaterThan(before.delivered);
-    expect(town.snapshot().lost).toBe(before.lost);
+    expect(town.snapshot().lost).toBeGreaterThan(before.lost);
     conservation(town);
   });
   it("does not crash an automation just because the app receives too much traffic", () => {
@@ -348,7 +351,7 @@ describe("player-led Hookdeck town", () => {
     app.setOnline(false);
     town.destinations.n8n.setOnline(false);
     expect(town.deployGuard()).toBe(0);
-    town.step(3);
+    town.step(4);
     expect(app.online).toBe(false);
     expect(town.destinations.n8n.online).toBe(false);
     expect(town.destinations.n8n.waiting).toBeGreaterThan(0);
@@ -357,7 +360,7 @@ describe("player-led Hookdeck town", () => {
     app.stopAllSpikes();
     app.setOnline(true);
     town.toggleEndpoint("n8n");
-    town.step(45);
+    town.step(100);
     expect(town.destinations.n8n.waiting).toBe(0);
     conservation(town);
   });
@@ -406,42 +409,49 @@ describe("player-led Hookdeck town", () => {
     expect(Object.values(app.sourceConnected)).toEqual([false, false, false]);
     conservation(town);
   });
-  it("holds every branch queue during bypass and resumes without duplicating deliveries", () => {
+  it("lets in-flight intake finish during bypass, then holds the queue without duplicating deliveries", () => {
     const app = new Simulation(),
       town = new Town(app);
     town.explore("n8n");
     app.startAllSpikes();
-    town.step(2);
+    town.step(4);
     const waiting = town.snapshot().waiting;
     app.disconnect();
+    town.step(4);
+    expect(town.snapshot().waiting).toBeGreaterThan(waiting);
+    const held = town.snapshot().waiting;
     town.step(2);
-    expect(town.snapshot().waiting).toBe(waiting);
+    expect(town.snapshot().waiting).toBe(held);
     expect(town.snapshot().lost).toBeGreaterThan(0);
     app.stopAllSpikes();
-    app.connect();
-    town.step(45);
+    town.deployGuard();
+    town.step(100);
     expect(town.snapshot().waiting).toBe(0);
     conservation(town);
   });
-  it("detaches provider traffic from both destinations, while existing queues keep draining", () => {
+  it("detaches new emissions while already-travelling requests finish and queues drain", () => {
     const app = new Simulation(),
       town = new Town(app);
     assemble(town);
     town.startEmergency("storm");
     town.deployGuard();
-    town.step(2);
-    const waiting = town.destinations.n8n.waiting;
-    expect(waiting).toBeGreaterThan(0);
+    town.step(4);
+    expect(town.destinations.n8n.waiting).toBeGreaterThan(0);
     town.toggleProvider("whatsapp");
     expect(app.sourceRates.whatsapp).toBe(0);
     const received = town.destinations.n8n.received;
-    town.step(3);
-    expect(town.destinations.n8n.received).toBe(received);
-    expect(town.destinations.n8n.waiting).toBeLessThan(waiting);
-    expect(app.sourceRates.shopify).toBeGreaterThan(0);
-    town.toggleProvider("whatsapp");
-    town.step(1);
+    town.step(3.2);
     expect(town.destinations.n8n.received).toBeGreaterThan(received);
+    const settled = town.destinations.n8n.received;
+    const waiting = town.destinations.n8n.waiting;
+    town.step(3);
+    expect(town.destinations.n8n.received).toBe(settled);
+    expect(town.destinations.n8n.waiting).toBeLessThan(waiting);
+    town.toggleProvider("whatsapp");
+    town.step(2.5);
+    expect(town.destinations.n8n.received).toBe(settled);
+    town.step(1);
+    expect(town.destinations.n8n.received).toBeGreaterThan(settled);
     conservation(town);
   });
   it("keeps detached providers disconnected when a named emergency starts", () => {
@@ -449,6 +459,7 @@ describe("player-led Hookdeck town", () => {
       town = new Town(app);
     assemble(town, "zapier");
     town.toggleProvider("shopify");
+    town.step(3.2);
     town.startEmergency("black-friday");
     const before = town.destinations.zapier.received;
     town.step(10);
@@ -481,7 +492,7 @@ describe("player-led Hookdeck town", () => {
     expect(town.destinations.make.received).toBe(0);
     town.explore();
     expect(town.automation).toBe("make");
-    town.step(2);
+    town.step(4);
     expect(town.destinations.make.received).toBeGreaterThan(0);
     expect(town.destinations.n8n.received).toBe(0);
     conservation(town);

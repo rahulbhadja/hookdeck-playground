@@ -29,8 +29,8 @@ The scene starts with **Your app** on its own. You control each step:
 
 1. **Add third-party webhooks** to connect Shopify, Stripe, and WhatsApp.
 2. **Add automation** and choose one destination: n8n, Zapier, or Make. Use Undo in the toolbar to go back and choose another.
-3. Start **Black Friday**, **Product launch**, or a **Webhook storm**. Sustained overload makes receiving computers shake and eventually go offline.
-4. **Deploy Hookdeck**. The central server rises into view, queues new arrivals, and delivers at a controlled pace to each destination. In this simulation, deployment also restarts receivers that crashed from overload.
+3. Start **Black Friday**, **Product launch**, or a **Webhook storm**. The surge travels to the receiving computers before they react. Sustained overload after arrival makes them shake and eventually go offline.
+4. **Deploy Hookdeck**. The central server rises into view, queues new arrivals, and delivers at a controlled pace to each destination. In this simulation, deployment also restarts stressed or overload-crashed receivers. Already-departed requests finish their original route; deploying does not erase them.
 5. Continue experimenting with traffic spikes, maintenance, and protection. Rushes stop after one minute of active play or when you choose **Stop rush**.
 
 Click a provider computer to attach or detach its traffic. Click Your app or the selected automation to take its endpoint offline or restore it. Deliberate maintenance remains under your control. Use the Hookdeck button to turn protection off; clicking the server itself does not remove it.
@@ -53,17 +53,17 @@ The status changes from **Rescue in progress** to **Rescue paused** when paused.
 
 ## Open a package
 
-Hover a connection to hold its packages still. Click a package, or tap its connection to select the nearest one. That parcel lifts out of the scene, unfolds, and reveals a printed receipt with:
+Hover a connection to hold the simulation and its packages still, with a one-second release grace so you can reach a box. Counters and overload timers pause with the scene. Click a package, or tap its connection to select the nearest one. That parcel lifts out of the scene, unfolds, and reveals a printed receipt with:
 
 - A provider-specific event, such as an order, payment, or message.
 - A sample JSON payload and package ID.
-- Explicit **Source** and **Destination** fields, including for outgoing Hookdeck packages.
+- Explicit **Source** and **Destination** fields, including the actual batch source for outgoing Hookdeck packages.
 
 Each visible parcel retains its sample contents from spawn. Inspection pauses the simulation and preserves its previous pause state. Click outside the package or press **Escape** to close it. The **Open a package** toolbar button also makes inspection available from the keyboard.
 
 ## Compare delivery
 
-Choose **Compare the same traffic** from the toolbar, or replay a spike from the event log. Two independent runs receive the same selected traffic pattern: one delivers directly, and the other uses Hookdeck. Switch views to compare delivered, still queued, and failed copies. The comparison preserves your original playground run.
+Choose **Compare the same traffic** from the toolbar, or replay a spike from the event log. Two independent runs receive the same selected traffic pattern: one delivers directly, and the other uses Hookdeck. Switch views to compare delivered, still queued, on-the-way, and failed copies. The comparison preserves your original playground run.
 
 After deploying Hookdeck, the **Protect my … webhooks** action opens setup guidance for your selected automation or application, with links to the relevant documentation and Hookdeck dashboard. It does not create live integrations.
 
@@ -96,7 +96,8 @@ Built with React, TypeScript, Three.js, React Three Fiber, Drei, and Vite. The s
 | `src/ComputerHardware.tsx` | Laptop model, brand displays, and Hookdeck server |
 | `src/Architecture.tsx` | Shared 3D geometry and studio reflections |
 | `src/BuildingLighting.tsx` | Activity, overload, and recovery lighting |
-| `src/simulation.ts` | Fixed-step traffic, queues, retries, and delivery accounting |
+| `src/simulation.ts` | Fixed-step traffic, in-flight batches, queues, retries, and arrival-based accounting |
+| `src/transit.ts` | Shared journey durations and flight records used by the engine and scene |
 | `src/town.ts` | Setup stages, providers, selected automation, and walkthrough orchestration |
 | `src/traffic.ts` | Named traffic patterns |
 | `src/demo.ts` | Rescue timing and story copy |
@@ -108,15 +109,17 @@ Built with React, TypeScript, Three.js, React Three Fiber, Drei, and Vite. The s
 | `src/styles.css` | Responsive interface |
 | `public/` | Locally served models, textures, and SVG logos |
 
-Tests cover traffic patterns, delivery accounting, retry behavior, overload and recovery, walkthrough timing, comparison replay, package identity, and hover timing.
+Tests cover traffic patterns, delivery accounting, retry behavior, overload and recovery, walkthrough timing, comparison replay, package identity, hover timing, causal arrival timing, in-flight route changes, and provider detachment.
 
 ## What the simulation represents
 
 - Traffic, payloads, capacities, and retry schedules are illustrative. They are not Hookdeck defaults, vendor limits, or performance benchmarks.
 - The simulation runs at 2× time using fixed steps. Visual packages represent groups of events, with synthetic sample payloads for inspection; they are not a trace of individual real requests.
-- Hookdeck buffers new arrivals and paces delivery. Previously failed direct deliveries remain in the counters. Turning Hookdeck off bypasses protection for new arrivals and holds its existing queue until re-enabled.
-- The rescue restarts overload-crashed endpoints as part of the story. A real gateway does not repair application bugs or restart your servers. Planned maintenance stays manual in the playground.
+- Journeys use three active-play seconds from a provider to the app or Hookdeck, then two seconds from Hookdeck to a destination. These are illustrative animation timings, not real network latency. Queues fill after intake arrival; delivery, failure, and overload are evaluated at the receiving endpoint.
+- Hookdeck buffers new arrivals and paces delivery. Previously failed direct deliveries remain in the counters. Turning Hookdeck off bypasses protection for new arrivals and holds its existing queue until re-enabled. Already-dispatched intake and delivery requests finish their journeys. Retry attempts also travel to the endpoint, and failure is decided on arrival.
+- The rescue restarts stressed and overload-crashed endpoints as part of the story. A real gateway does not repair application bugs or restart your servers. Planned maintenance stays manual in the playground.
 - Direct delivery has no durable input queue in this model. Real providers may retry, so a failed direct attempt here does not prove permanent loss in a real integration.
+- Accounting separates delivered, buffered, still travelling from Hookdeck, and failed copies. Provider-to-intake traffic is counted as received only when it arrives.
 - A delivery means the destination accepted a webhook, not that an automation finished processing it. A webhook sent to two destinations counts as two delivery copies.
 - The simulation does not promise exactly-once processing, ordering, or unlimited retention.
 

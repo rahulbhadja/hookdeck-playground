@@ -136,6 +136,22 @@ export default function App() {
   const [panel, setPanel] = useState<"help" | "events" | "setup" | null>(null);
   const [selectedParcel, setSelectedParcel] = useState<OpenParcel | null>(null);
   const packageRef = useRef<OpenParcel | null>(null);
+  const flowHeldRef = useRef(false);
+  const [flowHeld, setFlowHeld] = useState(false);
+  const flowRelease = useRef<number | undefined>(undefined);
+  const onFlowHover = useCallback((held: boolean) => {
+    window.clearTimeout(flowRelease.current);
+    if (held) {
+      flowHeldRef.current = true;
+      setFlowHeld(true);
+    } else {
+      flowRelease.current = window.setTimeout(() => {
+        flowHeldRef.current = false;
+        setFlowHeld(false);
+      }, 1000);
+    }
+  }, []);
+  useEffect(() => () => window.clearTimeout(flowRelease.current), []);
   const [inspectRequest, setInspectRequest] = useState(0);
   const replayRef = useRef<Comparison | null>(null);
   const [replay, setReplay] = useState<ComparisonSnapshot | null>(null);
@@ -455,6 +471,7 @@ export default function App() {
         !document.hidden &&
         !sim.paused &&
         !packageRef.current &&
+        !flowHeldRef.current &&
         town.mode !== "lobby" &&
         !(town.mode === "demo" && panel)
       ) {
@@ -585,14 +602,22 @@ export default function App() {
           ]
         : guided
           ? [guidedTitle, guidedHint]
-          : t.mode === "playing" && s.enabled && s.online
+          : s.enabled && s.flights.some((f) => f.leg === "direct")
             ? [
-                "Webhook delivery is protected.",
-                inSurge
-                  ? "Hookdeck queues the rush and paces each destination."
-                  : "Click providers to attach or detach. Click a destination to take it offline.",
+                "Traffic is switching to Hookdeck.",
+                "Requests already on the direct route still reach your app.",
               ]
-            : narrative(s);
+            : t.mode === "playing" &&
+                s.enabled &&
+                s.online &&
+                state.health === "healthy"
+              ? [
+                  "Webhook delivery is protected.",
+                  inSurge
+                    ? "Hookdeck queues the rush and paces each destination."
+                    : "Click providers to attach or detach. Click a destination to take it offline.",
+                ]
+              : narrative(s);
   const activeEvent = TRAFFIC_EVENTS.find(
     (event) => event.id === s.trafficEvent,
   );
@@ -829,11 +854,14 @@ export default function App() {
             }
           >
             <Scene
+              onFlowHover={onFlowHover}
+              playbackSpeed={replay ? COMPARISON_SPEED : 1}
               snapshot={{
                 ...shownSnapshot,
                 paused: replay
                   ? replay.paused || replay.complete || !visible || !!panel
                   : s.paused ||
+                    flowHeld ||
                     !!selectedParcel ||
                     !visible ||
                     (demoActive && !!panel),
@@ -1245,7 +1273,8 @@ export default function App() {
               </div>
               <p className="setting-hint">
                 {fmt(t.delivered)} delivered + {fmt(t.waiting)} buffered +{" "}
-                {fmt(t.lost)} failed = {fmt(t.received)} delivery copies.
+                {fmt(t.delivering)} on the way + {fmt(t.lost)} failed ={" "}
+                {fmt(t.received)} delivery copies.
               </p>
               {t.automation && (
                 <div className="destination-ledger">
@@ -1304,6 +1333,8 @@ export default function App() {
         data-mode={s.enabled ? "protected" : "direct"}
         data-health={state.health}
         data-delivered={s.delivered}
+        data-delivering={s.delivering}
+        data-clock={s.clock}
         data-waiting={s.waiting}
         data-failed={s.unsuccessful}
         data-online={s.online}

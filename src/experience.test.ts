@@ -145,7 +145,9 @@ describe("a fair traffic comparison", () => {
     expect(result.direct.received).toBeGreaterThan(0);
     expect(result.direct.received).toBe(result.protected.received);
     for (const run of [result.direct, result.protected]) {
-      expect(run.delivered + run.waiting + run.lost).toBe(run.received);
+      expect(run.delivered + run.waiting + run.delivering + run.lost).toBe(
+        run.received,
+      );
     }
     expect(result.direct.lost).toBeGreaterThan(0);
     expect(result.protected.waiting).toBeGreaterThan(0);

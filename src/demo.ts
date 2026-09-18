@@ -7,11 +7,11 @@ export const DEMO_TIMING = {
   providers: 4,
   automation: 10,
   launch: 15,
-  overload: 19,
-  crashed: 23.5,
+  overload: 22,
+  crashed: 26,
   guard: 28,
-  draining: 32,
-  steady: 41,
+  draining: 34,
+  steady: 44,
 } as const;
 export type DemoPhase = "app" | keyof typeof DEMO_TIMING | "complete";
 export type DemoSnapshot = {
@@ -85,8 +85,8 @@ export function demoStory(
       ];
     case "guard":
       return [
-        "Hookdeck buffers the rush.",
-        "Incoming webhooks are queued and delivered at a controlled rate.",
+        "New webhooks take the protected route.",
+        "Earlier requests finish their journey. New arrivals travel through Hookdeck.",
       ];
     case "draining":
       return [

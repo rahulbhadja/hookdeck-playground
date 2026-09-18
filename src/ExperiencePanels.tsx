@@ -106,6 +106,7 @@ export function ComparisonPanel({
               ["Received", "received"],
               ["Delivered", "delivered"],
               ["Still queued", "waiting"],
+              ["On the way", "delivering"],
               ["Failed", "lost"],
             ] as const
           ).map(([label, key]) => (
@@ -122,8 +123,8 @@ export function ComparisonPanel({
         </tbody>
       </table>
       <p className="comparison-note">
-        Queued events still need delivery. Counts include copies sent to your
-        automation.
+        Queued and in-flight events still need delivery. Counts include copies
+        sent to your automation.
       </p>
       <details className="comparison-assumptions">
         <summary>How this comparison works</summary>

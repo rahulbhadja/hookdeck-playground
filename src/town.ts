@@ -1,3 +1,4 @@
+import { INGRESS_SECONDS, DELIVERY_SECONDS } from "./transit";
 import {
   Simulation,
   SOURCES,
@@ -51,6 +52,7 @@ export type TownSnapshot = {
   destinations: Record<Automation, Snapshot>;
   delivered: number;
   waiting: number;
+  delivering: number;
   lost: number;
   received: number;
 };
@@ -91,6 +93,11 @@ export class Town {
   private pending = 0;
   private undoSteps: { label: string; restore: () => void }[] = [];
   constructor(readonly app: Simulation) {
+    for (const receiver of [app, ...Object.values(this.destinations)])
+      receiver.transit = {
+        ingress: INGRESS_SECONDS * TIME_SCALE,
+        delivery: DELIVERY_SECONDS * TIME_SCALE,
+      };
     this.reset();
   }
   private resetBranches() {
@@ -187,10 +194,14 @@ export class Town {
       ...(this.automation ? [this.destinations[this.automation]] : []),
     ];
     let restarted = 0;
-    // The game's rescue action restarts overload casualties. Deliberate
+    // The game's rescue action restarts stressed or crashed receivers, giving
+    // already-in-flight direct requests time to finish. Deliberate
     // maintenance remains player-controlled, and delivery history is retained.
     for (const receiver of receivers) {
-      if (receiver.offlineReason === "overload") {
+      if (
+        receiver.offlineReason === "overload" ||
+        (receiver.online && receiver.snapshot().overloadProgress > 0)
+      ) {
         receiver.setOnline(true);
         restarted++;
       }
@@ -338,6 +349,7 @@ export class Town {
       destinations,
       delivered: all.reduce((n, s) => n + s.delivered, 0),
       waiting: all.reduce((n, s) => n + s.waiting, 0),
+      delivering: all.reduce((n, s) => n + s.delivering, 0),
       lost: all.reduce((n, s) => n + s.unsuccessful, 0),
       received: all.reduce((n, s) => n + s.received, 0),
     };
